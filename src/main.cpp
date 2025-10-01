@@ -75,7 +75,7 @@ struct NTPServerManager {
 
 const uint8_t MAX_NTP_FAIL_COUNT = 5;      // Bir sunucudan diğerine geçmek için maksimum hata
 const unsigned long NTP_RETRY_INTERVAL = 10000;
-const unsigned long NTP_SYNC_INTERVAL = 30000;  // 30 saniyede bir senkronizasyon (daha sık)
+const unsigned long NTP_SYNC_INTERVAL = 10000;  // 10 saniyede bir senkronizasyon (çok daha sık)
 unsigned long lastNtpFailTime = 0;
 
 //================================================================================
@@ -98,10 +98,13 @@ struct PrecisionTimeManager {
     unsigned long lastNtpEpoch;
     unsigned long ntpCaptureMillis;
     bool isInitialized;
+    int32_t clockDriftMs;
+    unsigned long driftCaptureTime;
+    uint32_t ntpRoundTripTime;
 } timeSync;
 
 #define TARGET_SEND_MS 50
-#define SEND_TOLERANCE 5
+#define SEND_TOLERANCE 2
 
 //================================================================================
 // FONKSIYON PROTOTİPLERİ
@@ -298,30 +301,59 @@ bool updateTimeWithPrecision() {
         Serial.println("[NTP] Hata: Gecerli konfigurasyon yok");
         return false;
     }
-    
+
     if (!ethConnected) {
         Serial.println("[NTP] Hata: Ethernet baglantisi yok");
         return false;
     }
-    
-    unsigned long beforeMillis = millis();
-    
-    Serial.println("[NTP] ForceUpdate deneniyor...");
-    if (timeClient.forceUpdate()) {
-        unsigned long afterMillis = millis();
-        unsigned long roundTripTime = afterMillis - beforeMillis;
-        unsigned long estimatedMoment = beforeMillis + (roundTripTime / 2);
-        
-        timeSync.lastNtpEpoch = timeClient.getEpochTime();
-        timeSync.ntpCaptureMillis = estimatedMoment;
+
+    // Çoklu NTP örnekleme - en düşük RTT'yi seç
+    unsigned long bestRTT = 999999;
+    unsigned long bestEpoch = 0;
+    unsigned long bestCaptureMillis = 0;
+
+    for (int sample = 0; sample < 3; sample++) {
+        unsigned long beforeMillis = millis();
+
+        if (timeClient.forceUpdate()) {
+            unsigned long afterMillis = millis();
+            unsigned long roundTripTime = afterMillis - beforeMillis;
+
+            if (roundTripTime < bestRTT) {
+                bestRTT = roundTripTime;
+                bestEpoch = timeClient.getEpochTime();
+                bestCaptureMillis = beforeMillis + (roundTripTime / 2);
+            }
+        }
+
+        if (sample < 2) delay(100);
+    }
+
+    if (bestEpoch > 0) {
+        // Drift hesaplama (eğer önceki veri varsa)
+        if (timeSync.isInitialized) {
+            unsigned long localElapsed = millis() - timeSync.ntpCaptureMillis;
+            unsigned long expectedEpoch = timeSync.lastNtpEpoch + (localElapsed / 1000);
+            int32_t drift = (int32_t)(bestEpoch - expectedEpoch) * 1000;
+
+            // Drift'i güncelle (EWMA - üstel ağırlıklı ortalama)
+            timeSync.clockDriftMs = (timeSync.clockDriftMs * 7 + drift) / 8;
+
+            Serial.printf("[NTP] Drift: %ld ms\n", drift);
+        }
+
+        timeSync.lastNtpEpoch = bestEpoch;
+        timeSync.ntpCaptureMillis = bestCaptureMillis;
+        timeSync.ntpRoundTripTime = bestRTT;
         timeSync.isInitialized = true;
+        timeSync.driftCaptureTime = millis();
         ntpManager.lastSyncTime = millis();
-        
-        Serial.printf("[NTP] Sync OK | RTT: %lums | Epoch: %lu\n", 
-                      roundTripTime, timeSync.lastNtpEpoch);
+
+        Serial.printf("[NTP] Sync OK | RTT: %lums | Epoch: %lu | ClockDrift: %ldms\n",
+                      bestRTT, bestEpoch, timeSync.clockDriftMs);
         return true;
     } else {
-        Serial.println("[NTP] Hata: ForceUpdate basarisiz");
+        Serial.println("[NTP] Hata: Tum orneklemeler basarisiz");
         return false;
     }
 }
@@ -393,15 +425,18 @@ void setupPrecisionSync() {
     timeSync.lastNtpEpoch = 0;
     timeSync.ntpCaptureMillis = 0;
     timeSync.isInitialized = false;
-    
+    timeSync.clockDriftMs = 0;
+    timeSync.driftCaptureTime = 0;
+    timeSync.ntpRoundTripTime = 0;
+
     Serial.println("\n=== HASSAS SENKRONIZASYON SISTEMI ===");
     Serial.printf("Hedef gonderim zamani: %dms\n", TARGET_SEND_MS);
     Serial.printf("Tolerans: ±%dms\n", SEND_TOLERANCE);
     Serial.println("=====================================\n");
-    
+
     if (ethConnected && ntpManager.hasValidConfig) {
         Serial.println("Ilk hassas NTP senkronizasyonu yapiliyor...");
-        
+
         for (int attempt = 0; attempt < 5; attempt++) {
             if (updateTimeWithPrecision()) {
                 Serial.println("Hassas senkronizasyon basarili!");
@@ -421,6 +456,8 @@ void printSyncStatus() {
     Serial.printf("Milisaniye: %u / 1000\n", getPreciseMillisecond());
     Serial.printf("Hedef gonderim: %dms (±%dms)\n", TARGET_SEND_MS, SEND_TOLERANCE);
     Serial.printf("Son NTP: %lu ms once\n", millis() - ntpManager.lastSyncTime);
+    Serial.printf("Son RTT: %lu ms\n", timeSync.ntpRoundTripTime);
+    Serial.printf("Clock Drift: %ld ms\n", timeSync.clockDriftMs);
     Serial.println("============================\n");
 }
 
@@ -657,7 +694,7 @@ void applyReceivedNTPConfig() {
 
         // DÜZELTİLMİŞ KISIM: setPoolServerName kullan
         timeClient.setPoolServerName(ntp1.c_str());
-        timeClient.setUpdateInterval(30000);
+        timeClient.setUpdateInterval(10000);  // 10 saniye
         
         // Eğer daha önce başlatılmamışsa başlat
         if (!ntpConfigReceived) {
@@ -784,9 +821,18 @@ void handleSerialCommands() {
         } else if (command == "testsync") {
             Serial.println("10 saniye senkronizasyon testi...");
             for (int i = 0; i < 10; i++) {
-                Serial.printf("T+%ds: Epoch=%lu, Ms=%u\n", 
+                Serial.printf("T+%ds: Epoch=%lu, Ms=%u\n",
                               i, getPreciseEpochTime(), getPreciseMillisecond());
                 delay(1000);
+            }
+
+        } else if (command == "forcesync") {
+            Serial.println("Zorla NTP senkronizasyonu baslatiliyor...");
+            if (updateTimeWithPrecision()) {
+                Serial.println("Senkronizasyon basarili!");
+                printSyncStatus();
+            } else {
+                Serial.println("Senkronizasyon BASARISIZ!");
             }
 
         } else if (command == "help") {
@@ -796,6 +842,9 @@ void handleSerialCommands() {
             Serial.println("wdt        - Watchdog durumu");
             Serial.println("testmaster - Master kart baglantisi test");
             Serial.println("masterinfo - Master kart bilgileri");
+            Serial.println("sync       - Senkronizasyon durumu");
+            Serial.println("testsync   - 10 saniye senkronizasyon testi");
+            Serial.println("forcesync  - Zorla NTP senkronizasyonu");
             Serial.println("help       - Bu yardim");
             Serial.println("\n=== PROTOKOL ===");
             Serial.println("Master kart: 192168u, 001002y, 192169w, 001001x");
@@ -915,18 +964,18 @@ void setup() {
         String currentServer = ntpManager.usingNtp2 ? ntpManager.ntp2 : ntpManager.ntp1;
         timeClient.setPoolServerName(currentServer.c_str());
         
-        // KRITIK: Daha sık güncelleme için interval'i düşür (30 saniye)
-        timeClient.setUpdateInterval(30000);  // 30 saniye (120000'den düşürüldü)
-        
+        // KRITIK: Çok sık güncelleme için interval'i düşür (10 saniye)
+        timeClient.setUpdateInterval(10000);  // 10 saniye
+
         // NTP başlatmadan önce UDP socket'i optimize et
         ntpUDP.begin(123);  // NTP portu
-        
+
         timeClient.begin();
-        
+
         Serial.println("NTP istemcisi baslaniyor...");
         Serial.print("Baslangic NTP sunucusu: ");
         Serial.println(currentServer);
-        Serial.print("Guncelleme araligi: 30 saniye\n");
+        Serial.print("Guncelleme araligi: 10 saniye\n");
         
         feedWatchdog();
         
@@ -1003,8 +1052,8 @@ void loop() {
         feedWatchdog();
     }
 
-    // NTP senkronizasyonu
-    if (millis() - lastNtpUpdate >= 30000) {
+    // NTP senkronizasyonu - 10 saniyede bir
+    if (millis() - lastNtpUpdate >= 10000) {
         lastNtpUpdate = millis();
         if (ethConnected && ntpManager.hasValidConfig) {
             updateTimeWithPrecision();
